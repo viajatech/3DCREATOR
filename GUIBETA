@@ -1,0 +1,166 @@
+#by David Ruiz (@viajatech)
+
+#Si utilizas mi script recuerda dar créditos (Apache 2.0) 
+#Se agradece tu estrellita en el repo de github
+#https://github.com/viajatech
+
+
+#pip install --upgrade gradio rembg pillow trimesh shapely numpy scikit-image mapbox-earcut manifold3d plotly
+
+
+import gradio as gr
+from rembg import remove
+from PIL import Image
+import numpy as np
+import trimesh
+from shapely.geometry import Polygon, MultiPolygon
+from shapely.ops import unary_union
+from skimage import measure
+import plotly.graph_objects as go
+import tempfile
+
+def process_image(image):
+    img = image.convert("RGBA")
+    has_alpha = img.mode == "RGBA" and img.getchannel("A").getextrema()[1] < 255
+
+    if has_alpha:
+        mask = img.split()[-1]
+    else:
+        img_np = np.array(img)
+        img_no_bg = remove(img_np)
+        img = Image.fromarray(img_no_bg).convert("RGBA")
+        mask = img.split()[-1]
+
+    return img, mask
+
+def mask_to_polygons(mask):
+    mask_np = np.array(mask)
+    contours = measure.find_contours(mask_np, level=0.5)
+    polygons = []
+    for contour in contours:
+        poly = Polygon(contour)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if poly.is_valid and poly.area > 100:
+            polygons.append(poly)
+    if polygons:
+        unified = unary_union(polygons)
+        if isinstance(unified, Polygon):
+            return [unified]
+        elif isinstance(unified, MultiPolygon):
+            return list(unified.geoms)
+    return []
+
+def generate_3d_asset(image, mask):
+    polygons = mask_to_polygons(mask)
+    if not polygons:
+        print("No se encontraron polígonos en la máscara.")
+        return None
+
+    combined = unary_union(polygons)
+    if isinstance(combined, Polygon):
+        combined = [combined]
+    elif isinstance(combined, MultiPolygon):
+        combined = list(combined.geoms)
+    else:
+        print("Tipo de geometría desconocido después de la unión.")
+        return None
+
+    meshes = []
+    for poly in combined:
+        try:
+            extruded = trimesh.creation.extrude_polygon(poly, height=0.1, engine="earcut")
+            meshes.append(extruded)
+        except Exception as e:
+            print(f"Error al extruir el polígono: {e}")
+            continue
+
+    if not meshes:
+        print("No se pudo crear ninguna malla 3D.")
+        return None
+
+    combined_mesh = trimesh.util.concatenate(meshes)
+    texture = image.convert("RGB")
+    texture_path = save_temp_image(texture)
+
+    try:
+        texture_image = trimesh.visual.texture.load_image(texture_path)
+        combined_mesh.visual = trimesh.visual.texture.TextureVisuals(uv=combined_mesh.visual.uv, image=texture_image)
+    except Exception as e:
+        print(f"Error al aplicar la textura: {e}")
+
+    return combined_mesh
+
+def save_temp_image(image):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+        image.save(tmp.name, format="PNG")
+        return tmp.name
+
+def extract_glb(mesh):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".glb") as tmp:
+        mesh.export(tmp.name, file_type='glb')
+        return tmp.name
+
+def generate_plotly_mesh(mesh):
+    vertices = mesh.vertices
+    faces = mesh.faces
+
+    x, y, z = vertices[:,0], vertices[:,1], vertices[:,2]
+    i, j, k = faces[:,0], faces[:,1], faces[:,2]
+
+    fig = go.Figure(data=[go.Mesh3d(
+        x=x, y=y, z=z,
+        i=i, j=j, k=k,
+        name='mesh',
+        opacity=0.5
+    )])
+
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False)
+        ),
+        margin=dict(l=0, r=0, b=0, t=0)
+    )
+
+    return fig
+
+def on_generate(image):
+    if image is None:
+        return None, None, None, None
+    processed_img, mask = process_image(image)
+    mesh = generate_3d_asset(processed_img, mask)
+    if mesh is None:
+        return processed_img, mask, None, None
+    glb_file = extract_glb(mesh)
+    plotly_fig = generate_plotly_mesh(mesh)
+    return processed_img, mask, plotly_fig, glb_file
+
+with gr.Blocks() as demo:
+    gr.Markdown("# 3D Creator by Viaja Tech")
+    gr.Markdown(
+        """
+        **Image to 3D Asset Generator**
+    
+        - **Upload an image** y haz clic en **"Generate"** para crear un asset 3D.
+        - Si la imagen tiene un **canal alpha**, se usará como máscara.
+        - De lo contrario, se utilizará `rembg` para **eliminar el fondo**.
+        - Previsualiza el asset 3D generado en el visualizador 3D.
+        - Si estás satisfecho con el asset 3D generado, haz clic en **"Extract GLB"** para descargar el archivo GLB.
+        """
+    )
+    with gr.Row():
+        with gr.Column():
+            image_input = gr.Image(label="Subir Imagen", type="pil")
+            generate_button = gr.Button("Generate")
+        with gr.Column():
+            processed_image = gr.Image(label="Imagen Procesada")
+            mask_image = gr.Image(label="Máscara")
+    with gr.Row():
+        plotly_preview = gr.Plot(label="Previsualización 3D")
+        glb_output = gr.File(label="Extract GLB")
+    
+    generate_button.click(on_generate, inputs=image_input, outputs=[processed_image, mask_image, plotly_preview, glb_output])
+
+demo.launch(share=True)
